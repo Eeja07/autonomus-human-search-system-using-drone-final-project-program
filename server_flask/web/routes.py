@@ -13,11 +13,10 @@ from datetime import datetime
 
 from flask import request, jsonify, Response, send_from_directory
 
-# Definisikan path absolut ke folder photos dan recordings
+# Definisikan path absolut ke folder photos
 # Karena routes.py ada di folder 'web', kita naik satu tingkat ke 'server_flask'
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHOTOS_PATH = os.path.join(BASE_DIR, "photos")
-RECORDINGS_PATH = os.path.join(BASE_DIR, "recordings")
 
 def register_monitoring_routes(app, get_listener, get_autonomy, get_pipeline=None, get_yolo=None):
     
@@ -39,16 +38,7 @@ def register_monitoring_routes(app, get_listener, get_autonomy, get_pipeline=Non
                             "size": os.path.getsize(os.path.join(PHOTOS_PATH, f))
                         })
             
-            # 2. Baca folder recordings
-            if os.path.exists(RECORDINGS_PATH):
-                for f in os.listdir(RECORDINGS_PATH):
-                    if f.lower().endswith(('.mp4', '.avi', '.mkv')):
-                        files_data.append({
-                            "name": f,
-                            "type": "recording",
-                            "time": os.path.getmtime(os.path.join(RECORDINGS_PATH, f)),
-                            "size": os.path.getsize(os.path.join(RECORDINGS_PATH, f))
-                        })
+
             
             # Urutkan berdasarkan waktu (terbaru di atas)
             files_data.sort(key=lambda x: x["time"], reverse=True)
@@ -63,32 +53,13 @@ def register_monitoring_routes(app, get_listener, get_autonomy, get_pipeline=Non
         resp.headers['Access-Control-Allow-Origin'] = '*'
         return resp
 
-    @app.route("/api/storage/recordings/<filename>")
-    def get_recording(filename):
-        # 1. Tentukan path file
-        filepath = os.path.join(RECORDINGS_PATH, filename)
-        
-        # 2. Paksa MIME type untuk .mp4 agar browser tidak bingung
-        mimetype = None
-        if filename.lower().endswith('.mp4'):
-            mimetype = 'video/mp4'
-        elif filename.lower().endswith('.webm'):
-            mimetype = 'video/webm'
-            
-        # 3. Kirim file dengan mimetype yang dipaksa
-        resp = send_from_directory(RECORDINGS_PATH, filename, mimetype=mimetype)
-        
-        # 4. Tambahkan header penting untuk Video Streaming di web
-        resp.headers['Access-Control-Allow-Origin'] = '*'
-        resp.headers['Accept-Ranges'] = 'bytes' # WAJIB ADA untuk video
-        
-        return resp
+
     @app.route("/api/storage/delete/<filename>", methods=["DELETE"])
     def delete_file(filename):
         try:
             deleted = False
-            # Cari file di kedua folder
-            for folder_path in [PHOTOS_PATH, RECORDINGS_PATH]:
+            # Cari file di folder photos
+            for folder_path in [PHOTOS_PATH]:
                 filepath = os.path.join(folder_path, filename)
                 if os.path.exists(filepath):
                     os.remove(filepath)
@@ -111,8 +82,8 @@ def register_monitoring_routes(app, get_listener, get_autonomy, get_pipeline=Non
                 return jsonify({"success": False, "error": "New name required"}), 400
 
             renamed = False
-            # Cari file di kedua folder
-            for folder_path in [PHOTOS_PATH, RECORDINGS_PATH]:
+            # Cari file di folder photos
+            for folder_path in [PHOTOS_PATH]:
                 old_filepath = os.path.join(folder_path, filename)
                 if os.path.exists(old_filepath):
                     new_filepath = os.path.join(folder_path, new_name)

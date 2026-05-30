@@ -133,7 +133,7 @@ function App() {
           <button
             className={`storage-toggle-btn ${storageOpen ? 'active' : ''}`}
             onClick={() => setStorageOpen(o => !o)}
-            title="Storage – photos & recordings"
+            title="Storage – photos"
           >
             💾 Storage
           </button>

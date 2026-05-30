@@ -5,38 +5,29 @@ import './StoragePanel.css';
 function StoragePanel({ isOpen, onClose, onNotification, refreshTrigger }) {
   const [activeTab, setActiveTab] = useState('photos');
   const [photos, setPhotos] = useState([]);
-  const [recordings, setRecordings] = useState([]);
   const [loading, setLoading] = useState(false);
   const [previewItem, setPreviewItem] = useState(null);
   const [renameItem, setRenameItem] = useState(null);
   const [renameValue, setRenameValue] = useState('');
   const panelRef = useRef(null);
-  
+
   const onNotifRef = useRef(onNotification);
-  useEffect(() => { 
-    onNotifRef.current = onNotification; 
+  useEffect(() => {
+    onNotifRef.current = onNotification;
   }, [onNotification]);
 
   const fetchFiles = useCallback(async () => {
     setLoading(true);
     try {
       const data = await apiService.getStorageFiles();
-      
+
       const fetchedPhotos = data.filter(file => file.type === 'photo');
-      const fetchedRecordings = data.filter(file => file.type === 'recording');
 
-      setPhotos(fetchedPhotos.map(p => ({ 
-        ...p, 
-        filename: p.name, 
-        size: p.size || 0, 
-        modified: p.time ? new Date(p.time * 1000).toLocaleString() : 'Unknown' 
-      })));
-
-      setRecordings(fetchedRecordings.map(r => ({ 
-        ...r, 
-        filename: r.name, 
-        size: r.size || 0, 
-        modified: r.time ? new Date(r.time * 1000).toLocaleString() : 'Unknown' 
+      setPhotos(fetchedPhotos.map(p => ({
+        ...p,
+        filename: p.name,
+        size: p.size || 0,
+        modified: p.time ? new Date(p.time * 1000).toLocaleString() : 'Unknown'
       })));
 
     } catch (e) {
@@ -45,7 +36,7 @@ function StoragePanel({ isOpen, onClose, onNotification, refreshTrigger }) {
     } finally {
       setLoading(false);
     }
-  }, []); 
+  }, []);
 
   useEffect(() => {
     if (isOpen) fetchFiles();
@@ -53,7 +44,7 @@ function StoragePanel({ isOpen, onClose, onNotification, refreshTrigger }) {
 
   // FIX: Kembalikan fungsi getFileURL untuk menerima 2 argumen: type dan filename
   const getFileURL = (type, filename) => {
-    const folder = type === 'photo' ? 'photos' : 'recordings';
+    const folder = 'photos';
     return `${apiService.getBaseURL()}/api/storage/${folder}/${encodeURIComponent(filename)}`;
   };
 
@@ -115,7 +106,7 @@ function StoragePanel({ isOpen, onClose, onNotification, refreshTrigger }) {
     return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
   };
 
-  const currentFiles = activeTab === 'photos' ? photos : recordings;
+  const currentFiles = photos;
 
   if (!isOpen) return null;
 
@@ -132,11 +123,8 @@ function StoragePanel({ isOpen, onClose, onNotification, refreshTrigger }) {
         </div>
 
         <div className="storage-tabs">
-          <button className={`storage-tab ${activeTab === 'photos' ? 'active' : ''}`} onClick={() => setActiveTab('photos')}>
+          <button className="storage-tab active">
             📷 Photos ({photos.length})
-          </button>
-          <button className={`storage-tab ${activeTab === 'recordings' ? 'active' : ''}`} onClick={() => setActiveTab('recordings')}>
-            🎬 Recordings ({recordings.length})
           </button>
         </div>
 
@@ -146,12 +134,7 @@ function StoragePanel({ isOpen, onClose, onNotification, refreshTrigger }) {
           {!loading && currentFiles.map((file) => (
             <div key={file.filename} className="storage-item">
               <div className="storage-thumb" onClick={() => setPreviewItem(file)} title="Preview">
-                {activeTab === 'photos' ? (
-                  // FIX: Gunakan file.type, file.filename
-                  <img src={getFileURL(file.type, file.filename)} alt={file.filename} loading="lazy" />
-                ) : (
-                  <div className="storage-video-icon">▶</div>
-                )}
+                <img src={getFileURL(file.type, file.filename)} alt={file.filename} loading="lazy" />
               </div>
               <div className="storage-info" onClick={() => setPreviewItem(file)} title="Preview">
                 <div className="storage-filename">{file.filename}</div>
@@ -177,46 +160,15 @@ function StoragePanel({ isOpen, onClose, onNotification, refreshTrigger }) {
                 <button className="storage-close-btn" onClick={() => setPreviewItem(null)}>✕</button>
               </div>
             </div>
-            
+
             <div className="storage-preview-body" style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#111', minHeight: '300px' }}>
-              {previewItem.type === 'photo' ? (
-                <img 
-                  src={getFileURL(previewItem.type, previewItem.filename)} 
-                  alt={previewItem.filename} 
-                  style={{ maxWidth: '100%', maxHeight: '70vh', borderRadius: '8px' }} 
-                />
-              ) : (
-                /* Fallback untuk tipe file yang tidak didukung browser */
-                previewItem.filename.toLowerCase().endsWith('.mp4') ? (
-                  <video
-                    key={previewItem.filename}
-                    src={getFileURL(previewItem.type, previewItem.filename)}
-                    controls
-                    autoPlay
-                    style={{ maxWidth: '100%', maxHeight: '70vh', borderRadius: '8px' }}
-                  >
-                    Your browser does not support the video tag.
-                  </video>
-                ) : (
-                  <div style={{ textAlign: 'center', padding: '2rem', color: 'white' }}>
-                    <div style={{ fontSize: '4rem', marginBottom: '1rem' }}>🎬</div>
-                    <h3 style={{ margin: '0 0 10px 0' }}>Preview Browser Tidak Didukung</h3>
-                    <p style={{ margin: '0 0 20px 0', opacity: 0.7, maxWidth: '400px' }}>
-                      Format video ini ({previewItem.filename.split('.').pop()}) memerlukan media player khusus. Silakan download untuk memutarnya.
-                    </p>
-                    <a 
-                      href={getFileURL(previewItem.type, previewItem.filename)} 
-                      download={previewItem.filename} 
-                      className="btn btn-primary"
-                      style={{ padding: '12px 24px', background: '#4CAF50', color: 'white', textDecoration: 'none', borderRadius: '6px', fontWeight: 'bold', display: 'inline-block' }}
-                    >
-                      ⬇️ Download Video
-                    </a>
-                  </div>
-                )
-              )}
+              <img
+                src={getFileURL(previewItem.type, previewItem.filename)}
+                alt={previewItem.filename}
+                style={{ maxWidth: '100%', maxHeight: '70vh', borderRadius: '8px' }}
+              />
             </div>
-            
+
             <div className="storage-preview-footer">
               {formatSize(previewItem.size)} • {previewItem.modified}
             </div>

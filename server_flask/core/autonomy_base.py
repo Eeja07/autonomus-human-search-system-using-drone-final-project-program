@@ -117,6 +117,16 @@ class AutonomyBase(AutonomyHelpers):
     BATTERY_RTL_THRESHOLD = 15.0
     # Ambang pemulihan baterai; harus naik di atas ini agar flag RTL direset (hysteresis).
     BATTERY_RTL_RECOVER = 18.0
+    # Altitude minimum keselamatan dalam meter.
+    # Barometer drift sering menyebabkan relative_altitude_m lebih tinggi dari AGL asli.
+    # Contoh: log menunjukkan 1.6m padahal drone sebenarnya <60cm di atas tanah.
+    # Floor ini memastikan target altitude scout tidak pernah lebih rendah dari batas aman.
+    MIN_SAFE_ALTITUDE_M = 1.2
+    # Durasi climb darurat sebelum mengirim PX4 RTL (detik).
+    # Memberi drone waktu naik ke altitude aman sebelum RTL yang membawa drone horizontal dengan kecepatan tinggi.
+    SCOUT_PRE_RTL_CLIMB_S = 3.0
+    # Kecepatan climb (m/s, NED down negatif = naik) selama fase pre-RTL.
+    SCOUT_PRE_RTL_VZ = -0.8
     # Durasi maksimum target lock dipertahankan saat target tidak terlihat.
     TARGET_LOCK_MAX_AGE_S = 1.5
     # Rasio skor yang dibutuhkan agar sistem boleh berpindah dari target terkunci ke target baru.
@@ -221,6 +231,28 @@ class AutonomyBase(AutonomyHelpers):
             await self.stop_scout()
         # Menghentikan mode autonomy utama melalui implementasi stop() pada class turunan.
         await self.stop()
+        # === PRE-RTL SAFETY CLIMB ===
+        # Barometer drift: relative_altitude_m bisa jauh lebih tinggi dari AGL nyata.
+        # Climb paksa sebelum RTL agar drone tidak crash di ketinggian rendah.
+        try:
+            from mavsdk.offboard import VelocityNedYaw as _VNY
+            cur_yaw = self.state_dict.get("attitude", {}).get("yaw", 0.0)
+            logger.info("EMERGENCY PRE-RTL → climbing %.1fs at vz=%.1f", self.SCOUT_PRE_RTL_CLIMB_S, self.SCOUT_PRE_RTL_VZ)
+            import asyncio as _aio
+            climb_end = _aio.get_event_loop().time() + self.SCOUT_PRE_RTL_CLIMB_S
+            while _aio.get_event_loop().time() < climb_end:
+                try:
+                    await self.drone.offboard.set_velocity_ned(_VNY(0.0, 0.0, self.SCOUT_PRE_RTL_VZ, cur_yaw))
+                except Exception:
+                    break
+                await _aio.sleep(0.05)
+            # Stop horizontal before RTL handoff.
+            try:
+                await self.drone.offboard.set_velocity_ned(_VNY(0.0, 0.0, 0.0, cur_yaw))
+            except Exception:
+                pass
+        except Exception as climb_err:
+            logger.error("EMERGENCY PRE-RTL climb error: %s", climb_err)
         # try digunakan agar kegagalan perintah RTL tidak membuat exception tidak tertangani.
         try:
             # return_to_launch adalah perintah MAVSDK agar drone pulang ke launch/home point autopilot.

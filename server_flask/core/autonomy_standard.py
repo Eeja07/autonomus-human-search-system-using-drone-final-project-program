@@ -215,11 +215,32 @@ class AutonomyStandard(AutonomyBase):
             # Perintah emergency hanya dipicu sekali saat state belum EMERGENCY.
             if self._state != AutonomyState.EMERGENCY:
                 # Mencatat warning karena baterai kritis membutuhkan tindakan RTL.
-                logger.warning("Baterai kritis %.1f%% — RTL", battery)
+                logger.warning("Baterai kritis %.1f%% — pre-RTL climb + RTL", battery)
                 # State standard dipindah ke EMERGENCY.
                 self._state = AutonomyState.EMERGENCY
                 # Mengirim event emergency ke frontend/client.
                 self._emit("autonomy:emergency", {"reason": "low battery", "battery": battery})
+                # === PRE-RTL SAFETY CLIMB ===
+                # Barometer drift: climb paksa sebelum RTL agar tidak crash di ketinggian rendah.
+                cur_yaw = tstate.get("attitude", {}).get("yaw", 0.0)
+                logger.info("STD PRE-RTL → climbing %.1fs at vz=%.1f", self.SCOUT_PRE_RTL_CLIMB_S, self.SCOUT_PRE_RTL_VZ)
+                climb_deadline = asyncio.get_event_loop().time() + self.SCOUT_PRE_RTL_CLIMB_S
+                while asyncio.get_event_loop().time() < climb_deadline:
+                    try:
+                        await self.drone.offboard.set_velocity_ned(
+                            VelocityNedYaw(0.0, 0.0, self.SCOUT_PRE_RTL_VZ, cur_yaw)
+                        )
+                    except Exception:
+                        break
+                    await asyncio.sleep(self.CONTROL_PERIOD)
+                # Stop sebelum handoff ke RTL.
+                try:
+                    await self.drone.offboard.set_velocity_ned(
+                        VelocityNedYaw(0.0, 0.0, 0.0, cur_yaw)
+                    )
+                except Exception:
+                    pass
+                logger.info("STD PRE-RTL → climb complete, sending RTL")
                 # try digunakan agar kegagalan RTL tercatat tanpa membuat loop crash.
                 try:
                     # Memerintahkan drone return_to_launch melalui MAVSDK action.

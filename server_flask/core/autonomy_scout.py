@@ -66,7 +66,10 @@ class AutonomyController(AutonomyStandard):
         # Flag ini menentukan apakah setelah kembali ke home scout drone harus berhenti/hold.
         self._scout_return_then_hold = False
         # Menyimpan altitude target scout berdasarkan altitude saat scout dimulai.
-        self._target_altitude_scout = alt
+        # Clamp ke MIN_SAFE_ALTITUDE_M: barometer drift sering membuat relative_altitude_m
+        # lebih tinggi dari AGL nyata (misal log 1.6m padahal drone <60cm).
+        # Tanpa clamp, altitude hold bisa mempertahankan ketinggian yang terlalu rendah.
+        self._target_altitude_scout = max(alt, self.MIN_SAFE_ALTITUDE_M)
         # Menyimpan posisi home khusus scout berdasarkan posisi drone saat mode scout dimulai.
         self._scout_home_position = {
             # Latitude home scout diambil dari state posisi; default 0 jika data belum tersedia.
@@ -579,12 +582,37 @@ class AutonomyController(AutonomyStandard):
                     # Flag hysteresis mencegah trigger berulang dari fluktuasi baterai sesaat.
                     self._battery_rtl_triggered = True
                     # Log misi: battery RTL dipicu.
-                    logger.info("MISSION → battery RTL triggered (%.0f%%), sending PX4 RTL", battery)
+                    logger.info("MISSION → battery RTL triggered (%.0f%%), pre-RTL climb phase", battery)
                     # Kirim event ke frontend.
-                    self._emit_scout_state("RETURN_HOME", {"message": "Baterai rendah, PX4 RTL"})
+                    self._emit_scout_state("RETURN_HOME", {"message": "Baterai rendah, climbing sebelum RTL"})
                     # Hentikan mode scout.
                     self._scout_mode = False
                     self._scout_state = ScoutState.IDLE
+                    # === PRE-RTL SAFETY CLIMB ===
+                    # Barometer drift menyebabkan relative_altitude_m bisa jauh lebih tinggi dari AGL nyata.
+                    # Contoh: log 1.6m padahal drone sebenarnya <60cm.
+                    # Jika langsung RTL, PX4 akan terbang horizontal di ketinggian rendah → crash.
+                    # Solusi: climb paksa selama SCOUT_PRE_RTL_CLIMB_S detik sebelum kirim RTL.
+                    cur_yaw = self.state_dict.get("attitude", {}).get("yaw", 0.0)
+                    logger.info("PRE-RTL → climbing at vz=%.1f for %.1fs", self.SCOUT_PRE_RTL_VZ, self.SCOUT_PRE_RTL_CLIMB_S)
+                    climb_deadline = asyncio.get_event_loop().time() + self.SCOUT_PRE_RTL_CLIMB_S
+                    while asyncio.get_event_loop().time() < climb_deadline:
+                        try:
+                            await self.drone.offboard.set_velocity_ned(
+                                VelocityNedYaw(0.0, 0.0, self.SCOUT_PRE_RTL_VZ, cur_yaw)
+                            )
+                        except Exception as climb_err:
+                            logger.error("PRE-RTL climb cmd failed: %s", climb_err)
+                            break
+                        await asyncio.sleep(SCOUT_LOOP_PERIOD)
+                    # Hentikan gerak sebelum RTL.
+                    try:
+                        await self.drone.offboard.set_velocity_ned(
+                            VelocityNedYaw(0.0, 0.0, 0.0, cur_yaw)
+                        )
+                    except Exception:
+                        pass
+                    logger.info("PRE-RTL → climb complete, sending PX4 RTL")
                     # Gunakan PX4 native RTL ke takeoff/operator home, bukan scout start position.
                     try:
                         await self.drone.action.return_to_launch()
@@ -600,6 +628,13 @@ class AutonomyController(AutonomyStandard):
                 alt = float(self.state_dict.get("position", {}).get("alt", 0.0))
                 # Menentukan altitude target scout; jika belum ada target, gunakan altitude aktual.
                 target_alt = self._target_altitude_scout if self._target_altitude_scout is not None else alt
+                # Altitude floor enforcement: jika altitude terlapor turun di bawah MIN_SAFE_ALTITUDE_M,
+                # paksa target altitude ke floor agar vz mendorong drone naik.
+                # Ini mengatasi barometer drift di mana log menunjukkan 1.6m tapi drone sebenarnya <60cm.
+                if target_alt < self.MIN_SAFE_ALTITUDE_M:
+                    target_alt = self.MIN_SAFE_ALTITUDE_M
+                    self._target_altitude_scout = target_alt
+                    logger.warning("ALT FLOOR → target_alt clamped to %.1fm (baro drift protection)", target_alt)
                 # Dampen altitude gain saat di zona ideal/dekat document transition untuk kurangi oscillation vz.
                 kp_alt_eff = self.SCOUT_KP_ALT
                 if self._scout_state == ScoutState.APPROACH and self._last_movement_zone in ("ideal", "near"):
