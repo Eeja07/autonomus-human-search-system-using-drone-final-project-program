@@ -121,6 +121,8 @@ class AutonomyController(AutonomyStandard):
             # Menunggu task benar-benar selesai; return_exceptions=True mencegah CancelledError merusak alur stop.
             await asyncio.gather(self._scout_task, return_exceptions=True)
 
+        # TEST_F: Log summary misi saat stop manual agar data selalu tercetak.
+        self._log_test_f_summary("stop_manual")
         # Mengembalikan ringkasan jumlah koordinat/person yang ditemukan selama scout aktif.
         return {"success": True, "summary": {"people_found": len(self._scout_visited_coords)}}
 
@@ -176,20 +178,15 @@ class AutonomyController(AutonomyStandard):
         if target is not None:
             self._approach_confirm_count += 1
             if self._approach_confirm_count >= self.SCOUT_APPROACH_CONFIRM_FRAMES:
-                # State diubah menjadi APPROACH agar loop berikutnya menjalankan logika mendekati target.
                 self._scout_state = ScoutState.APPROACH
-                # Reset waktu kehilangan target dan smoothing karena pendekatan target baru dimulai.
                 self._target_lost_time, self._smooth_cx, self._smooth_cy = None, None, None
-                # Reset D-term dan hysteresis state untuk approach baru.
                 self._prev_err_x = 0.0
                 self._last_movement_zone = "idle"
-                # Menyimpan waktu mulai approach untuk membatasi durasi pendekatan.
                 self._approach_start_time = asyncio.get_event_loop().time()
-                # Reset counter konfirmasi.
                 self._approach_confirm_count = 0
-                # Mengirim event bahwa drone mulai mendekati target.
+                # TEST_A: Log transisi SCAN→APPROACH.
+                self._log_fsm_transition("SCAN", "APPROACH")
                 self._emit_scout_state("APPROACH", {"message": "Mendekat"})
-                # Return menghentikan eksekusi SCAN pada iterasi ini karena state sudah berubah.
                 return
         else:
             # Reset counter jika target hilang di antara frame konfirmasi.
@@ -226,13 +223,11 @@ class AutonomyController(AutonomyStandard):
 
         # Jika durasi approach melebihi batas timeout, proses pendekatan dibatalkan.
         if self._approach_start_time and (cur_time - self._approach_start_time) > self.SCOUT_APPROACH_TIMEOUT_S:
-            # Kembali ke mode scan untuk mencari ulang target.
+            # TEST_A: Log transisi APPROACH→SCAN (timeout).
+            self._log_fsm_transition("APPROACH", "SCAN", "timeout")
             self._reset_scout_scan()
-            # Mengirim event timeout approach ke sistem.
             self._emit_scout_state("SCAN", {"message": "Timeout"})
-            # Menghentikan gerak horizontal sambil tetap menjaga koreksi vertikal dan yaw saat ini.
             await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, vz, cur_yaw))
-            # Return karena penanganan timeout sudah selesai pada iterasi ini.
             return
 
         # Mengambil daftar deteksi terbaru; jika tidak ada data deteksi, gunakan list kosong.
@@ -250,13 +245,11 @@ class AutonomyController(AutonomyStandard):
             if not self._target_lost_time: self._target_lost_time = cur_time
             # Timeout kehilangan target lebih toleran (Issue #9: dari 2s ke parameter yang dikonfigurasi).
             if (cur_time - self._target_lost_time) > self.SCOUT_TARGET_LOST_TIMEOUT_S:
-                # Reset ke state SCAN untuk mencari target baru.
+                # TEST_A: Log transisi APPROACH→SCAN (target lost).
+                self._log_fsm_transition("APPROACH", "SCAN", "lost")
                 self._reset_scout_scan()
-                # Mengirim event bahwa target hilang.
                 self._emit_scout_state("SCAN", {"message": "Hilang"})
-            # Selama target hilang, drone dihentikan horizontal tetapi tetap menjaga altitude dengan vz.
             await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, vz, cur_yaw))
-            # Return karena tidak ada target yang bisa dipakai untuk menghitung arah gerak.
             return
         
         # Jika target kembali terlihat, reset indikator waktu hilang.
@@ -295,23 +288,22 @@ class AutonomyController(AutonomyStandard):
             # Multi-frame confirmation: target harus stabil beberapa frame sebelum DOCUMENT.
             self._document_confirm_count += 1
             if self._document_confirm_count >= self.SCOUT_DOCUMENT_CONFIRM_FRAMES:
-                # Log alasan transisi DOCUMENT (err_y dilaporkan sebagai info saja).
                 logger.info("DOCUMENT TRIGGER → err_x=%.3f err_y=%.3f(info) bbox=%.3f confirm=%d",
                     err_x_n, err_y_n, bbox_ratio, self._document_confirm_count)
-                # State diubah ke DOCUMENT agar loop berikutnya/aksi saat ini melakukan dokumentasi.
+                # TEST_A: Log transisi APPROACH→DOCUMENT.
+                self._log_fsm_transition("APPROACH", "DOCUMENT")
+                # TEST_D: Log posisi GPS saat DOCUMENT trigger untuk akurasi navigasi.
+                d_pos = self.state_dict.get("position", {})
+                logger.info("TEST_D → document_trigger lat=%.7f lon=%.7f alt=%.2f bbox=%.3f err_x=%.3f",
+                    float(d_pos.get("lat",0)), float(d_pos.get("lon",0)), float(d_pos.get("alt",0)), bbox_ratio, err_x_n)
                 self._scout_state = ScoutState.DOCUMENT
-                # Simpan snapshot frame dan deteksi SAAT INI agar screenshot akurat dengan posisi BBox centered.
                 self._document_snapshot_detection = self._latest_detection
                 self._document_snapshot_frame = None
                 if self._camera_source and hasattr(self._camera_source, 'latest_frame') and self._camera_source.latest_frame is not None:
                     self._document_snapshot_frame = self._camera_source.latest_frame.copy()
-                # Mengirim event bahwa scout masuk tahap dokumentasi.
                 self._emit_scout_state("DOCUMENT")
-                # Reset counter setelah transisi.
                 self._document_confirm_count = 0
-                # Menghentikan gerak horizontal; gunakan vz altitude-hold only (tidak ada koreksi err_y).
                 await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, vz, cur_yaw))
-                # Return karena proses approach selesai.
                 return
         else:
             # Soft-decrement: jitter sesaat tidak menghapus semua progress konfirmasi.
@@ -375,24 +367,32 @@ class AutonomyController(AutonomyStandard):
         if cspeed > self.SCOUT_MAX_VEL:
             vx, vy = (vx / cspeed) * self.SCOUT_MAX_VEL, (vy / cspeed) * self.SCOUT_MAX_VEL
 
-        # Telemetry snapshot ~5Hz: mencatat semua variabel penting approach untuk analisis post-flight.
-        # err_y dilaporkan sebagai debug/info; TIDAK mempengaruhi vz command.
-        # Rate-limited oleh _log_telemetry_snapshot; tidak memperlambat loop 20Hz.
+        # TEST_G: Log raw vs smoothed untuk analisis EMA.
+        if target is not None:
+            logger.info("TEST_G_EMA → raw_cx=%.3f smooth_cx=%.3f raw_cy=%.3f smooth_cy=%.3f alpha=%.2f",
+                cx, self._smooth_cx or 0, cy, self._smooth_cy or 0, effective_alpha)
+
+        # TEST_C: Bawa capture_timestamp dari deteksi untuk pipeline latency.
+        cap_ts = 0.0
+        if self._latest_detection and hasattr(self._latest_detection, 'capture_timestamp'):
+            cap_ts = self._latest_detection.capture_timestamp
+
         self._log_telemetry_snapshot(
             scout_state=self._scout_state.name,
             bbox_ratio=bbox_ratio,
             err_x=err["error_x_normalized"],
-            err_y=err_y_signed,  # info only
+            err_y=err_y_signed,
             is_centered=is_centered,
             cmd_vn=vx,
             cmd_ve=vy,
-            cmd_vz=vz,  # altitude-hold vz only; no err_y altitude correction
+            cmd_vz=vz,
+            capture_timestamp=cap_ts,
         )
 
-        # Mengirim perintah velocity akhir ke drone melalui MAVSDK offboard.
-        # vz dipakai (altitude-hold only); err_y TIDAK dipakai untuk koreksi altitude.
-        # Fixed forward-facing camera: Y position dalam frame bukan indikator altitude error yang reliabel.
         await self.drone.offboard.set_velocity_ned(VelocityNedYaw(vx, vy, vz, yaw_t))
+        # TEST_C: t5 — VelocityNedYaw dikirim ke Pixhawk. Log total pipeline E2E dari frame capture.
+        if cap_ts > 0:
+            logger.info("TEST_C_CMD → t5_cmd_sent total_e2e=%.1fms", (time.time() - cap_ts) * 1000)
 
     # Handler state DOCUMENT; drone mencatat lokasi target dan mengambil screenshot/dokumentasi.
     async def _scout_state_document(self, vz: float):
@@ -408,15 +408,15 @@ class AutonomyController(AutonomyStandard):
 
         # Mengecek semua koordinat yang sudah pernah dikunjungi agar target yang sama tidak didokumentasikan ulang.
         for v in self._scout_visited_coords:
-            # Jika jarak koordinat lama ke posisi sekarang lebih kecil dari radius eksklusi, lokasi dianggap sudah dikunjungi.
             if self._haversine_distance_m(v["lat"], v["lon"], d_lat, d_lon) < self.SCOUT_EXCLUSION_RADIUS_M:
-                # Duplicate detected: skip documentation, displace, re-enter SCAN.
                 logger.info("MISSION → duplicate skipped (%.5f, %.5f)", d_lat, d_lon)
-                # Kirim event ke frontend.
+                # TEST_F: Increment duplicate skip counter.
+                self._test_duplicates_skipped += 1
+                logger.info("TEST_F → duplicate_skip total=%d at=(%.5f,%.5f)", self._test_duplicates_skipped, d_lat, d_lon)
                 self._emit_scout_state("SCAN", {"message": "Sudah dikunjungi, displacement"})
-                # Lakukan displacement untuk berpindah dari area yang sudah dikunjungi.
+                # TEST_A: Log transisi DOCUMENT→DISPLACING (duplicate).
+                self._log_fsm_transition("DOCUMENT", "DISPLACING")
                 self._start_displacement(cur_yaw)
-                # Return karena dokumentasi tidak perlu dilakukan ulang.
                 return
 
         # Mengambil screenshot scout menggunakan snapshot frame dari saat target centered (jika tersedia).
@@ -429,18 +429,24 @@ class AutonomyController(AutonomyStandard):
         # Membersihkan snapshot setelah digunakan.
         self._document_snapshot_frame = None
         self._document_snapshot_detection = None
-        # Menambahkan koordinat dokumentasi ke daftar visited agar tidak diulang pada cycle berikutnya.
         self._scout_visited_coords.append({"lat": d_lat, "lon": d_lon})
-        # Membersihkan lock target person setelah target berhasil didokumentasikan.
         self._clear_person_target_lock()
-        # Log misi: target berhasil didokumentasikan.
         logger.info("MISSION → target documented (%.5f, %.5f) file=%s", d_lat, d_lon, fname)
-        # Mengirim event bahwa target telah didokumentasikan, termasuk koordinat dan nama file screenshot.
+        # TEST_F: Increment documented count dan log cycle time.
+        self._test_targets_documented += 1
+        cycle_time = time.time() - self._test_last_cycle_start if self._test_last_cycle_start > 0 else 0
+        if cycle_time > 0:
+            self._test_cycle_times.append(cycle_time)
+        self._test_last_cycle_start = time.time()
+        flight_elapsed = time.time() - self._test_mission_start_time if self._test_mission_start_time > 0 else 0
+        logger.info("TEST_F → documented total=%d cycle_time=%.1fs flight_elapsed=%.0fs duplicates=%d",
+            self._test_targets_documented, cycle_time, flight_elapsed, self._test_duplicates_skipped)
+        # TEST_D: Log posisi dokumentasi aktual.
+        logger.info("TEST_D → documented_pos lat=%.7f lon=%.7f alt=%.2f", d_lat, d_lon, float(self.state_dict.get("position",{}).get("alt",0)))
         self._emit("scout:documented", {"lat": d_lat, "lon": d_lon, "screenshot": fname})
-        # Hover singkat 2 detik memberi jeda agar dashboard tampilkan DOCUMENT sebelum lanjut.
         await asyncio.sleep(2.0)
-        # Persistent scouting: setelah dokumentasi, lakukan displacement kecil lalu scan lagi.
-        # TIDAK kembali ke home scout — misi berlanjut sampai baterai habis atau dihentikan manual.
+        # TEST_A: Log transisi DOCUMENT→DISPLACING.
+        self._log_fsm_transition("DOCUMENT", "DISPLACING")
         self._start_displacement(cur_yaw)
 
     # Helper untuk memulai state DISPLACING: simpan posisi awal dan waktu mulai.
@@ -461,6 +467,9 @@ class AutonomyController(AutonomyStandard):
         self._scout_displacement_facing_yaw = cur_yaw
         self._scout_state = ScoutState.DISPLACING
         logger.info("MISSION → right displacement start facing_yaw=%.0f move_yaw=%.0f", cur_yaw, right_yaw)
+        # TEST_D: Log posisi GPS sebelum displacement.
+        dp = self.state_dict.get("position", {})
+        logger.info("TEST_D → displacement_start lat=%.7f lon=%.7f", float(dp.get("lat",0)), float(dp.get("lon",0)))
         self._emit_scout_state("DISPLACING", {"message": "Right displacement dimulai"})
 
     # Handler state DISPLACING; drone bergerak maju ~5m lalu kembali ke SCAN.
@@ -484,12 +493,14 @@ class AutonomyController(AutonomyStandard):
         if dist_moved >= self.SCOUT_DISPLACEMENT_M or timeout:
             if timeout:
                 logger.warning("MISSION → displacement timeout after %.1fs", elapsed)
-            # Hentikan gerak horizontal.
             await self.drone.offboard.set_velocity_ned(VelocityNedYaw(0.0, 0.0, vz, cur_yaw))
-            # Bersihkan state displacement.
+            # TEST_D: Log posisi GPS setelah displacement dan jarak aktual vs target.
+            logger.info("TEST_D → displacement_end lat=%.7f lon=%.7f moved=%.2fm target=%.1fm error=%.2fm",
+                cur_lat, cur_lon, dist_moved, self.SCOUT_DISPLACEMENT_M, abs(dist_moved - self.SCOUT_DISPLACEMENT_M))
             self._scout_displacement_start_pos = None
             self._scout_displacement_start_time = None
-            # Kembali ke SCAN untuk siklus berikutnya.
+            # TEST_A: Log transisi DISPLACING→SCAN.
+            self._log_fsm_transition("DISPLACING", "SCAN")
             logger.info("MISSION → right displacement complete (moved=%.1fm), re-entering SCAN", dist_moved)
             self._reset_scout_scan()
             self._emit_scout_state("SCAN", {"message": "Right displacement selesai, scan lagi"})
@@ -565,10 +576,11 @@ class AutonomyController(AutonomyStandard):
     async def _scout_main_loop(self):
         # Saat loop dimulai, scout selalu masuk state SCAN terlebih dahulu.
         self._reset_scout_scan()
-        # Mengirim event awal bahwa scout berada pada state SCAN.
         self._emit_scout_state("SCAN")
-        # loop_count menghitung jumlah iterasi loop untuk logging dan kebutuhan periodik lain.
         loop_count = 0
+        # TEST_F: Catat waktu mulai misi untuk durasi total.
+        self._test_mission_start_time = time.time()
+        self._test_last_cycle_start = time.time()
 
         # Selama mode scout aktif, loop ini terus menjalankan handler sesuai state saat ini.
         while self._scout_mode:
@@ -579,21 +591,18 @@ class AutonomyController(AutonomyStandard):
                 # Mengecek baterai dengan hysteresis untuk mencegah trigger palsu dari noise sensor.
                 battery = self.state_dict.get("battery_pct", 100)
                 if battery < self.BATTERY_RTL_THRESHOLD and not self._battery_rtl_triggered:
-                    # Flag hysteresis mencegah trigger berulang dari fluktuasi baterai sesaat.
                     self._battery_rtl_triggered = True
-                    # Log misi: battery RTL dipicu.
+                    # TEST_E: Record trigger timestamp for response time measurement.
+                    _rtl_trigger_time = time.time()
                     logger.info("MISSION → battery RTL triggered (%.0f%%), pre-RTL climb phase", battery)
-                    # Kirim event ke frontend.
+                    logger.info("TEST_E → battery_rtl_trigger batt=%.1f%% timestamp=%.3f", battery, _rtl_trigger_time)
                     self._emit_scout_state("RETURN_HOME", {"message": "Baterai rendah, climbing sebelum RTL"})
-                    # Hentikan mode scout.
                     self._scout_mode = False
                     self._scout_state = ScoutState.IDLE
-                    # === PRE-RTL SAFETY CLIMB ===
-                    # Barometer drift menyebabkan relative_altitude_m bisa jauh lebih tinggi dari AGL nyata.
-                    # Contoh: log 1.6m padahal drone sebenarnya <60cm.
-                    # Jika langsung RTL, PX4 akan terbang horizontal di ketinggian rendah → crash.
-                    # Solusi: climb paksa selama SCOUT_PRE_RTL_CLIMB_S detik sebelum kirim RTL.
+                    # TEST_F: Log mission summary saat battery RTL via helper (juga dipanggil di stop_scout).
+                    self._log_test_f_summary("battery_rtl")
                     cur_yaw = self.state_dict.get("attitude", {}).get("yaw", 0.0)
+                    alt_before = float(self.state_dict.get("position", {}).get("alt", 0.0))
                     logger.info("PRE-RTL → climbing at vz=%.1f for %.1fs", self.SCOUT_PRE_RTL_VZ, self.SCOUT_PRE_RTL_CLIMB_S)
                     climb_deadline = asyncio.get_event_loop().time() + self.SCOUT_PRE_RTL_CLIMB_S
                     while asyncio.get_event_loop().time() < climb_deadline:
@@ -605,20 +614,23 @@ class AutonomyController(AutonomyStandard):
                             logger.error("PRE-RTL climb cmd failed: %s", climb_err)
                             break
                         await asyncio.sleep(SCOUT_LOOP_PERIOD)
-                    # Hentikan gerak sebelum RTL.
                     try:
                         await self.drone.offboard.set_velocity_ned(
                             VelocityNedYaw(0.0, 0.0, 0.0, cur_yaw)
                         )
                     except Exception:
                         pass
+                    alt_after = float(self.state_dict.get("position", {}).get("alt", 0.0))
+                    _rtl_complete_time = time.time()
+                    # TEST_E: Log response time and altitude gain.
+                    logger.info("TEST_E → pre_rtl_complete response_time=%.0fms alt_before=%.2f alt_after=%.2f gain=%.2fm expected=%.2fm",
+                        (_rtl_complete_time - _rtl_trigger_time) * 1000, alt_before, alt_after,
+                        alt_after - alt_before, abs(self.SCOUT_PRE_RTL_VZ) * self.SCOUT_PRE_RTL_CLIMB_S)
                     logger.info("PRE-RTL → climb complete, sending PX4 RTL")
-                    # Gunakan PX4 native RTL ke takeoff/operator home, bukan scout start position.
                     try:
                         await self.drone.action.return_to_launch()
                     except Exception as rtl_err:
                         logger.error("Battery RTL command failed: %s", rtl_err)
-                    # Keluar dari loop setelah RTL dikirim.
                     break
                 elif battery > self.BATTERY_RTL_RECOVER:
                     # Reset flag hysteresis saat baterai sudah di atas ambang pemulihan.
@@ -634,25 +646,26 @@ class AutonomyController(AutonomyStandard):
                 if target_alt < self.MIN_SAFE_ALTITUDE_M:
                     target_alt = self.MIN_SAFE_ALTITUDE_M
                     self._target_altitude_scout = target_alt
-                    logger.warning("ALT FLOOR → target_alt clamped to %.1fm (baro drift protection)", target_alt)
+                    # TEST_E: Increment altitude floor clamp counter.
+                    self._test_alt_floor_clamp_count += 1
+                    logger.warning("ALT FLOOR → target_alt clamped to %.1fm (baro drift protection) TEST_E count=%d",
+                        target_alt, self._test_alt_floor_clamp_count)
                 # Dampen altitude gain saat di zona ideal/dekat document transition untuk kurangi oscillation vz.
                 kp_alt_eff = self.SCOUT_KP_ALT
                 if self._scout_state == ScoutState.APPROACH and self._last_movement_zone in ("ideal", "near"):
                     kp_alt_eff = self.SCOUT_KP_ALT_DAMPED
                 # Menghitung velocity vertikal untuk menjaga altitude, dibatasi antara -SCOUT_MAX_VZ dan SCOUT_MAX_VZ.
                 vz = max(-self.SCOUT_MAX_VZ, min(self.SCOUT_MAX_VZ, -kp_alt_eff * (target_alt - alt)))
-                # Jika state saat ini SCAN, jalankan handler pencarian target.
+                # TEST_H: Log resource snapshot periodik (setiap 5 detik).
+                self._log_resource_snapshot(self._scout_state.name)
+
                 if self._scout_state == ScoutState.SCAN: await self._scout_state_scan(vz, loop_count)
-                # Jika state saat ini APPROACH, jalankan handler mendekati target.
                 elif self._scout_state == ScoutState.APPROACH: await self._scout_state_approach(vz, loop_count)
-                # Jika state saat ini DOCUMENT, jalankan handler dokumentasi target.
                 elif self._scout_state == ScoutState.DOCUMENT: await self._scout_state_document(vz)
-                # Jika state saat ini DISPLACING, jalankan handler perpindahan eksplorasi.
                 elif self._scout_state == ScoutState.DISPLACING: await self._scout_state_displacing(vz)
-                # Jika state saat ini RETURN_HOME, jalankan handler kembali ke home scout (legacy/manual stop path).
                 elif self._scout_state == ScoutState.RETURN_HOME: await self._scout_state_return_home(vz, loop_count)
 
-                # Sleep sesuai periode loop agar frekuensi kontrol sekitar 20 Hz dan tidak membebani event loop.
+                # Sleep sesuai periode loop agar frekuensi kontrol sekitar 20 Hz.
                 await asyncio.sleep(SCOUT_LOOP_PERIOD)
             # Menangkap semua exception agar error dicatat dan loop bisa mencoba lanjut pada iterasi berikutnya.
             except Exception as e:

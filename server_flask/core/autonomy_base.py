@@ -12,6 +12,8 @@ import asyncio
 import time
 # logging digunakan untuk mencatat informasi, warning, dan error dari modul autonomy base.
 import logging
+# subprocess digunakan untuk membaca suhu CPU (vcgencmd) dalam TEST_H thermal monitoring.
+import subprocess
 # Enum dan auto digunakan untuk membuat kumpulan state bernama yang aman dibaca dan dibandingkan.
 from enum import Enum, auto
 # Queue adalah struktur antrian thread-safe untuk menerima hasil YOLO, Empty adalah exception saat queue kosong.
@@ -217,6 +219,30 @@ class AutonomyBase(AutonomyHelpers):
         self.frame_height = 480
         # _telemetry_last_log menyimpan timestamp terakhir snapshot TEL ditulis; rate ~5Hz (0.2s interval).
         self._telemetry_last_log: float = 0.0
+        # TEST_A: Counter transisi FSM untuk validasi state machine.
+        self._test_fsm_counters: Dict = {
+            "SCAN_to_APPROACH": 0,
+            "APPROACH_to_DOCUMENT": 0,
+            "DOCUMENT_to_DISPLACING": 0,
+            "DISPLACING_to_SCAN": 0,
+            "APPROACH_to_SCAN_timeout": 0,
+            "APPROACH_to_SCAN_lost": 0,
+            "APPROACH_to_SCAN_other": 0,
+        }
+        # TEST_F: Counter misi multi-target.
+        self._test_mission_start_time: float = 0.0
+        self._test_targets_documented: int = 0
+        self._test_duplicates_skipped: int = 0
+        self._test_cycle_times: list = []
+        self._test_last_cycle_start: float = 0.0
+        # TEST_H: Timestamp resource log terakhir untuk rate-limiting (setiap 5 detik).
+        self._resource_last_log: float = 0.0
+        self._resource_log_interval: float = 5.0
+        # TEST_E: Counter altitude floor clamp.
+        self._test_alt_floor_clamp_count: int = 0
+        # TEST_G: Counter target lock switch.
+        self._test_lock_switch_count: int = 0
+        self._test_lock_start_time: float = 0.0
     # start harus diimplementasikan oleh class turunan karena base class belum tahu strategi kontrol spesifik.
     async def start(self): raise NotImplementedError
     # stop harus diimplementasikan oleh class turunan karena proses penghentian bisa berbeda per mode.
@@ -235,6 +261,7 @@ class AutonomyBase(AutonomyHelpers):
         # Barometer drift: relative_altitude_m bisa jauh lebih tinggi dari AGL nyata.
         # Climb paksa sebelum RTL agar drone tidak crash di ketinggian rendah.
         try:
+            # pyrefly: ignore [missing-import]
             from mavsdk.offboard import VelocityNedYaw as _VNY
             cur_yaw = self.state_dict.get("attitude", {}).get("yaw", 0.0)
             logger.info("EMERGENCY PRE-RTL → climbing %.1fs at vz=%.1f", self.SCOUT_PRE_RTL_CLIMB_S, self.SCOUT_PRE_RTL_VZ)
@@ -352,6 +379,7 @@ class AutonomyBase(AutonomyHelpers):
         cmd_vn: float = 0.0,
         cmd_ve: float = 0.0,
         cmd_vz: float = 0.0,
+        capture_timestamp: float = 0.0,
     ) -> None:
         """Write a compact TEL → snapshot at ~5Hz. No-op if called too frequently."""
         now = time.monotonic()
@@ -384,6 +412,118 @@ class AutonomyBase(AutonomyHelpers):
             cmd_vn, cmd_ve, cmd_vz,
             batt,
         )
+
+        # TEST_C: Log latency autonomy-side (detection → autonomy read → velocity command).
+        if capture_timestamp > 0:
+            total_lat_ms = (time.time() - capture_timestamp) * 1000
+            det_to_autonomy_ms = 0.0
+            if self._latest_detection and hasattr(self._latest_detection, 'timestamp'):
+                det_to_autonomy_ms = (time.time() - self._latest_detection.timestamp) * 1000
+            logger.info(
+                "TEST_C_AUTONOMY \u2192 total_pipeline=%.1fms det_to_cmd=%.1fms state=%s",
+                total_lat_ms, det_to_autonomy_ms, scout_state
+            )
+
+    # TEST_A: Log transisi FSM dengan counter dan timestamp untuk validasi state machine.
+    def _log_fsm_transition(self, from_state: str, to_state: str, reason: str = ""):
+        """Catat transisi FSM untuk Skenario A: validasi state machine."""
+        key = f"{from_state}_to_{to_state}"
+        if reason:
+            key = f"{from_state}_to_{to_state}_{reason}"
+        if key in self._test_fsm_counters:
+            self._test_fsm_counters[key] += 1
+        else:
+            self._test_fsm_counters[key] = 1
+        logger.info(
+            "TEST_A \u2192 transition=%s count=%d reason=%s counters=%s",
+            key, self._test_fsm_counters.get(key, 0), reason,
+            str(self._test_fsm_counters)
+        )
+
+    # TEST_F: Helper untuk log summary misi multi-target.
+    # Dipanggil dari stop_scout() (stop manual) dan jalur battery RTL agar summary selalu tercetak.
+    def _log_test_f_summary(self, reason: str = "") -> None:
+        """Log TEST_F_SUMMARY: targets, duplicates, flight_duration, avg_cycle."""
+        flight_dur = time.time() - self._test_mission_start_time if self._test_mission_start_time > 0 else 0
+        avg_cycle = (
+            sum(self._test_cycle_times) / len(self._test_cycle_times)
+            if self._test_cycle_times else 0
+        )
+        logger.info(
+            "TEST_F_SUMMARY → reason=%s targets=%d duplicates=%d "
+            "flight_duration=%.0fs avg_cycle=%.1fs cycles=%d",
+            reason, self._test_targets_documented, self._test_duplicates_skipped,
+            flight_dur, avg_cycle, len(self._test_cycle_times)
+        )
+
+    # TEST_H: Baca dan log resource usage (CPU, suhu, RAM) secara periodik.
+    def _log_resource_snapshot(self, scout_state: str = ""):
+        """Log CPU, temperature, dan RAM setiap _resource_log_interval detik."""
+        now = time.monotonic()
+        if (now - self._resource_last_log) < self._resource_log_interval:
+            return
+        self._resource_last_log = now
+
+        temp_c = 0.0
+        cpu_pct = 0.0
+        ram_used_mb = 0.0
+        ram_total_mb = 0.0
+        throttled = "N/A"
+
+        try:
+            # Baca suhu SoC via vcgencmd (Raspberry Pi).
+            result = subprocess.run(
+                ["vcgencmd", "measure_temp"],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0:
+                # Output: temp=42.3'C
+                temp_str = result.stdout.strip().replace("temp=", "").replace("'C", "")
+                temp_c = float(temp_str)
+        except Exception:
+            pass
+
+        try:
+            # Baca CPU usage dari /proc/loadavg (1-minute average).
+            with open("/proc/loadavg", "r") as f:
+                load_1m = float(f.read().split()[0])
+                # Konversi ke persentase estimasi (4-core RPi5).
+                cpu_pct = load_1m * 25.0  # rough: load 4.0 = 100%
+        except Exception:
+            pass
+
+        try:
+            # Baca RAM dari /proc/meminfo.
+            with open("/proc/meminfo", "r") as f:
+                lines = f.readlines()
+                mem_total = 0
+                mem_available = 0
+                for line in lines:
+                    if line.startswith("MemTotal:"):
+                        mem_total = int(line.split()[1])  # kB
+                    elif line.startswith("MemAvailable:"):
+                        mem_available = int(line.split()[1])  # kB
+                ram_total_mb = mem_total / 1024.0
+                ram_used_mb = (mem_total - mem_available) / 1024.0
+        except Exception:
+            pass
+
+        try:
+            # Cek throttle events (under-voltage, thermal throttle).
+            result = subprocess.run(
+                ["vcgencmd", "get_throttled"],
+                capture_output=True, text=True, timeout=2
+            )
+            if result.returncode == 0:
+                throttled = result.stdout.strip()
+        except Exception:
+            pass
+
+        logger.info(
+            "TEST_H \u2192 state=%s temp=%.1f\u00b0C cpu_est=%.0f%% ram_used=%.0f/%.0fMB throttle=%s",
+            scout_state, temp_c, cpu_pct, ram_used_mb, ram_total_mb, throttled
+        )
+
     # current_state adalah property read-only untuk membaca state autonomy sebagai string.
     @property
     def current_state(self) -> str:

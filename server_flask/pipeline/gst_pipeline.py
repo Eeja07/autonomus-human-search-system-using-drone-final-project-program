@@ -211,15 +211,21 @@ class GStreamerPipeline:
             frame = np.frombuffer(map_info.data, dtype=np.uint8).reshape((h, w, 3)).copy()
             self.latest_frame = frame.copy()
 
+            # TEST_C: Simpan timestamp capture (t0) untuk pengukuran latency pipeline end-to-end.
+            # Timestamp ini akan dibawa bersama frame ke YOLO dan autonomy untuk mengukur Δt per stage.
+            t_capture = now  # 'now' sudah dihitung di atas untuk FPS
+
             # 4. KIRIM KE YOLO (Non-blocking / Tidak Menunggu)
             # Menggunakan put_nowait agar thread GStreamer tidak tertahan jika YOLO lambat
+            # Frame dikirim sebagai tuple (frame, t_capture) untuk membawa timestamp capture.
+            frame_with_ts = (frame, t_capture)
             try:
-                self.frame_queue.put_nowait(frame)
+                self.frame_queue.put_nowait(frame_with_ts)
             except Full:
                 # Jika antrean penuh, buang frame lama dan masukkan yang terbaru
                 try:
                     self.frame_queue.get_nowait() # Buang frame "basi"
-                    self.frame_queue.put_nowait(frame) # Masukkan frame segar
+                    self.frame_queue.put_nowait(frame_with_ts) # Masukkan frame segar
                 except:
                     pass
 

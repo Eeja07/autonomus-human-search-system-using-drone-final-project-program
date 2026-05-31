@@ -122,10 +122,16 @@ class ConnectionWatchdog:
                 elif not self.connected and was_connected:
                     # Log warning karena kehilangan koneksi adalah kondisi berisiko.
                     logger.warning("Watchdog: CONNECTION LOST")
+                    # TEST_E: Catat timestamp saat disconnect terdeteksi untuk pengukuran response time.
+                    _t_disconnect = time.time()
+                    logger.info("TEST_E → watchdog_disconnect_detected timestamp=%.3f", _t_disconnect)
                     # Mengirim status disconnected ke frontend melalui Socket.IO.
                     self._emit_status("disconnected", "CONNECTION LOST")
                     # Memanggil callback disconnect secara aman.
                     await self._safe_callback(self._on_disconnect)
+                    # TEST_E: Log response time dari disconnect detection hingga emergency action selesai.
+                    logger.info("TEST_E → watchdog_emergency_response response_time=%.0fms",
+                        (time.time() - _t_disconnect) * 1000)
 
         # CancelledError terjadi saat task watchdog dibatalkan oleh stop().
         except asyncio.CancelledError:

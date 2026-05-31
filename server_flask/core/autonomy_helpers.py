@@ -324,6 +324,13 @@ class AutonomyHelpers:
             best["last_seen"] = now
             # Menyimpan salinan kandidat terbaik sebagai target lock internal.
             self._target_lock = best.copy()
+            # TEST_G: Log initial target lock.
+            logger.info(
+                "TEST_G → lock_init cx=%.3f cy=%.3f score=%.3f conf=%.3f area=%.4f",
+                best["cx_norm"], best["cy_norm"], best.get("score", 0), best["confidence"], best["area"]
+            )
+            if hasattr(self, '_test_lock_start_time'):
+                self._test_lock_start_time = now
             # Mengembalikan kandidat terbaik sebagai target aktif.
             return best
 
@@ -342,6 +349,15 @@ class AutonomyHelpers:
             # Ganti target hanya kalau kandidat baru jelas lebih kuat.
             # Kondisi ini mencegah perpindahan target kecuali best jauh lebih baik daripada target yang match.
             if best is not matched and best["score"] > matched["score"] * switch_ratio:
+                # TEST_G: Log target switch (lock berubah ke kandidat baru).
+                lock_duration = now - locked.get("locked_at", now)
+                logger.info(
+                    "TEST_G → lock_switch old_score=%.3f new_score=%.3f duration=%.2fs reason=score_superior",
+                    matched["score"], best["score"], lock_duration
+                )
+                if hasattr(self, '_test_lock_switch_count'):
+                    self._test_lock_switch_count += 1
+                    self._test_lock_start_time = now
                 # Target baru mulai dikunci pada waktu sekarang.
                 best["locked_at"] = now
                 # Target baru juga dianggap terakhir terlihat pada waktu sekarang.
@@ -365,6 +381,15 @@ class AutonomyHelpers:
         best["locked_at"] = now
         # last_seen target baru diisi waktu sekarang.
         best["last_seen"] = now
+        # TEST_G: Log target lock expired and replaced.
+        lock_duration = now - locked.get("locked_at", now)
+        logger.info(
+            "TEST_G → lock_expired old_duration=%.2fs new_score=%.3f",
+            lock_duration, best.get("score", 0)
+        )
+        if hasattr(self, '_test_lock_switch_count'):
+            self._test_lock_switch_count += 1
+            self._test_lock_start_time = now
         # Menyimpan target baru sebagai target lock.
         self._target_lock = best.copy()
         # Mengembalikan target baru.

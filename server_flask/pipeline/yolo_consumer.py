@@ -31,6 +31,7 @@ class Detection:
     cx: float = 0.0          # center x normalized
     cy: float = 0.0          # center y normalized
     area: float = 0.0        # bbox area normalized
+    class_id: int = 0        # TEST_B: class id untuk analisis per-kelas
 
 
 @dataclass
@@ -40,6 +41,11 @@ class DetectionFrame:
     timestamp: float = 0.0
     inference_ms: float = 0.0
     fps: float = 0.0
+    # TEST_C: timestamp saat frame ditangkap oleh GStreamer (t0) untuk pipeline latency analysis.
+    capture_timestamp: float = 0.0
+    # TEST_B: dimensi frame untuk kalkulasi bbox ratio di log.
+    frame_width: int = 320
+    frame_height: int = 320
 
 
 class YOLOConsumer:
@@ -124,8 +130,10 @@ class YOLOConsumer:
     def _load_tflite(self, path: str):
         try:
             # Gunakan tflite_runtime jika ada, jika tidak fallback ke tensorflow.lite
+            # pyrefly: ignore [missing-import]
             import tflite_runtime.interpreter as tflite
         except ImportError:
+            # pyrefly: ignore [missing-import]
             import tensorflow.lite as tflite
 
         self._interpreter = tflite.Interpreter(model_path=path)
@@ -143,6 +151,7 @@ class YOLOConsumer:
         self._model = "tflite_loaded"
         logger.info("YOLO TFLite loaded: %s input=%dx%d", path, self._input_w, self._input_h)
     def _load_onnx(self, path: str):
+        # pyrefly: ignore [missing-import]
         import onnxruntime as ort
 
         providers = ["CPUExecutionProvider"]
@@ -161,6 +170,7 @@ class YOLOConsumer:
         logger.info("YOLO ONNX loaded: %s input=%dx%d", path, self._input_w, self._input_h)
 
     def _load_pytorch(self, path: str):
+        # pyrefly: ignore [missing-import]
         from ultralytics import YOLO
         self._pt_model = YOLO(path)
         self._backend = "pytorch"
@@ -171,13 +181,27 @@ class YOLOConsumer:
         """Main worker: read frame → infer → put result."""
         logger.info("YOLO worker thread running")
         _t_last = time.time()
+        # TEST_B: Counter kumulatif untuk analisis akurasi deteksi in-flight.
+        self._total_frames_processed = 0
+        self._total_detections = 0
+        # TEST_C: Akumulasi latency untuk rata-rata per 50 frame.
+        self._latency_accum = []
 
         while self._running:
+            # TEST_C: Frame sekarang datang sebagai tuple (frame, t_capture) dari GStreamer.
+            # Backward-compatible: jika masih ndarray biasa, t_capture = None.
             try:
-                frame = self.frame_queue.get(timeout=0.5)
+                raw_item = self.frame_queue.get(timeout=0.5)
             except Empty:
                 continue
 
+            if isinstance(raw_item, tuple) and len(raw_item) == 2:
+                frame, t_capture = raw_item
+            else:
+                frame, t_capture = raw_item, None
+
+            # TEST_C: t1 = frame masuk queue (sudah diparsing), t2 = YOLO mulai inferensi.
+            t_queue_read = time.time()
             t0 = time.time()
             try:
                 detections = self._run_inference(frame)
@@ -197,23 +221,67 @@ class YOLOConsumer:
                 if duration > 0:
                     self._fps = (len(self._frame_times) - 1) / duration
 
+            # TEST_B: Update counter kumulatif.
+            self._total_frames_processed += 1
+            self._total_detections += len(detections)
+
+            # Dapatkan dimensi frame untuk frame_width/frame_height di DetectionFrame.
+            fh, fw = frame.shape[:2]
+
             result = DetectionFrame(
                 detections=detections,
                 timestamp=t1,
                 inference_ms=infer_ms,
                 fps=self._fps,
+                capture_timestamp=t_capture or t1,
+                frame_width=fw,
+                frame_height=fh,
             )
-            self.latest_result = result  # <--- TAMBAHKAN BARIS INI
-            # Non-blocking put: drop oldest if full
-            # === BARIS SEMENTARA UNTUK SCREENSHOT BAB 3 ===
-            det_summary = ", ".join([f"{d.class_name}({d.confidence:.2f})" for d in detections])
+            self.latest_result = result
+
+            # TEST_B: Log terstruktur deteksi in-flight untuk analisis akurasi.
+            # Format: TEST_B → count, confidence per detection, bbox ratio, FPS aktual.
             if detections:
-                logger.info("YOLO [thread=%s] → %d detections: [%s] | inference=%.1fms | fps=%.1f",
-                    threading.current_thread().name, len(detections), det_summary, infer_ms, self._fps)
+                for d in detections:
+                    bh = d.bbox[3] - d.bbox[1]  # normalized height
+                    bw = d.bbox[2] - d.bbox[0]  # normalized width
+                    logger.info(
+                        "TEST_B → cls=%s conf=%.3f bbox_ratio=%.3f bbox_area=%.4f cx=%.3f cy=%.3f fps=%.1f infer=%.1fms",
+                        d.class_name, d.confidence, bh, bw * bh, d.cx, d.cy, self._fps, infer_ms
+                    )
             else:
-                logger.info("YOLO [thread=%s] → no detection | inference=%.1fms | fps=%.1f",
-                    threading.current_thread().name, infer_ms, self._fps)
-            # === AKHIR BARIS SEMENTARA ===
+                # TEST_B: Log frame tanpa deteksi (False Negative tracking).
+                logger.info("TEST_B → no_detection fps=%.1f infer=%.1fms", self._fps, infer_ms)
+
+            # TEST_C: Log pipeline latency per-stage jika t_capture tersedia.
+            if t_capture is not None:
+                lat_capture_to_queue = (t_queue_read - t_capture) * 1000
+                lat_queue_to_yolo = (t0 - t_queue_read) * 1000
+                lat_yolo_infer = infer_ms
+                lat_total_to_yolo_out = (t1 - t_capture) * 1000
+                self._latency_accum.append({
+                    "cap2q": lat_capture_to_queue,
+                    "q2yolo": lat_queue_to_yolo,
+                    "infer": lat_yolo_infer,
+                    "total": lat_total_to_yolo_out,
+                })
+                # Log setiap 50 frame untuk ringkasan tanpa spam.
+                if len(self._latency_accum) >= 50:
+                    avg_c2q = sum(e["cap2q"] for e in self._latency_accum) / len(self._latency_accum)
+                    avg_q2y = sum(e["q2yolo"] for e in self._latency_accum) / len(self._latency_accum)
+                    avg_inf = sum(e["infer"] for e in self._latency_accum) / len(self._latency_accum)
+                    avg_tot = sum(e["total"] for e in self._latency_accum) / len(self._latency_accum)
+                    min_tot = min(e["total"] for e in self._latency_accum)
+                    max_tot = max(e["total"] for e in self._latency_accum)
+                    logger.info(
+                        "TEST_C_YOLO → avg_capture_to_queue=%.1fms avg_queue_to_yolo=%.1fms "
+                        "avg_infer=%.1fms avg_total=%.1fms min=%.1fms max=%.1fms (n=%d)",
+                        avg_c2q, avg_q2y, avg_inf, avg_tot, min_tot, max_tot,
+                        len(self._latency_accum)
+                    )
+                    self._latency_accum = []
+
+            # Non-blocking put: drop oldest if full
             try:
                 self.detection_queue.put_nowait(result)
             except Exception:
@@ -223,6 +291,12 @@ class YOLOConsumer:
                 except Exception:
                     pass
 
+        # TEST_B: Log ringkasan total saat worker berhenti.
+        logger.info(
+            "TEST_B_SUMMARY → total_frames=%d total_detections=%d avg_det_per_frame=%.2f",
+            self._total_frames_processed, self._total_detections,
+            self._total_detections / max(1, self._total_frames_processed)
+        )
         logger.info("YOLO worker thread stopped")
 
     def _run_inference(self, frame: np.ndarray) -> List[Detection]:
@@ -244,6 +318,7 @@ class YOLOConsumer:
 
     def _preprocess_onnx(self, frame: np.ndarray) -> np.ndarray:
         """BGR → RGB → float32 NCHW normalized."""
+        # pyrefly: ignore [missing-import]
         import cv2
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (self._input_w, self._input_h))
@@ -254,6 +329,7 @@ class YOLOConsumer:
 
     def _postprocess_onnx(self, outputs, orig_w: int, orig_h: int) -> List[Detection]:
             """Parse YOLOv8 ONNX output and apply NMS."""
+            # pyrefly: ignore [missing-import]
             import cv2
             
             # YOLOv8 ONNX: output shape [1, 84, 8400] (4 box + 80 classes)
@@ -311,11 +387,13 @@ class YOLOConsumer:
                         cx=float(cx_n),
                         cy=float(cy_n),
                         area=float(bw_n * bh_n),
+                        class_id=int(class_ids[i]) if i < len(class_ids) else 0,
                     ))
 
             return results
     def _preprocess_tflite(self, frame: np.ndarray) -> np.ndarray:
         """BGR → RGB → float32 NHWC normalized."""
+        # pyrefly: ignore [missing-import]
         import cv2
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         img = cv2.resize(img, (self._input_w, self._input_h))
@@ -342,6 +420,7 @@ class YOLOConsumer:
         return self._postprocess_onnx([output_data], w, h)
     def _infer_pytorch(self, frame: np.ndarray) -> List[Detection]:
         """Run ultralytics YOLO inference."""
+        # pyrefly: ignore [missing-import]
         import cv2
         img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         results = self._pt_model(

@@ -26,10 +26,13 @@ import time
 from typing import Dict, Optional, Callable
 
 # System adalah class utama MAVSDK yang merepresentasikan koneksi ke drone/Pixhawk.
+# pyrefly: ignore [missing-import]
 from mavsdk import System
 # VelocityNedYaw adalah format setpoint offboard berisi velocity north/east/down dan yaw.
+# pyrefly: ignore [missing-import]
 from mavsdk.offboard import VelocityNedYaw
 # FlightMode adalah enum MAVSDK untuk membandingkan mode terbang, terutama OFFBOARD.
+# pyrefly: ignore [missing-import]
 from mavsdk.telemetry import FlightMode
 
 # logger dibuat per modul agar log dapat ditelusuri berasal dari mavsdk_listener.py.
@@ -466,91 +469,49 @@ class MAVSDKListener:
     # _telemetry_broadcast_loop mengirim ringkasan state telemetri ke frontend pada 5 Hz.
     async def _telemetry_broadcast_loop(self):
         """Broadcast telemetry state to frontend at 5Hz."""
-        # Loop broadcast berjalan selama listener aktif.
         while self._running:
-            # try menjaga agar error emit/transformation tidak mematikan loop broadcast.
             try:
-                # raw_state adalah referensi ke state telemetri internal terbaru.
                 raw_state = self.state
-                # transformed adalah format data yang disederhanakan untuk dikirim ke frontend.
                 transformed = {
-                    # connected menunjukkan status koneksi drone.
                     "connected": raw_state.get("connected", False),
-                    # armed menunjukkan status armed/disarmed.
                     "armed": raw_state.get("armed", False),
-                    # mode adalah flight_mode dalam nama field yang lebih umum untuk frontend.
                     "mode": raw_state.get("flight_mode", "UNKNOWN"),
-                    # battery adalah persentase baterai.
                     "battery": raw_state.get("battery_pct", 0.0),
-                    # voltage adalah tegangan baterai.
                     "voltage": raw_state.get("voltage", 0.0),
-                    # current adalah arus listrik jika tersedia di state; default 0.0 jika belum ada.
                     "current": raw_state.get("current", 0.0),
-                    # heading adalah arah hadap kompas drone.
                     "heading": raw_state.get("heading", 0.0),
-                    # in_offboard memberi tahu frontend apakah mode OFFBOARD sedang aktif.
                     "in_offboard": raw_state.get("in_offboard", False),
-                    # last_update adalah timestamp pembaruan telemetri terakhir.
                     "last_update": raw_state.get("last_update", 0.0),
                 }
 
-                # Position data
-                # pos mengambil dictionary posisi dari raw_state.
                 pos = raw_state.get("position", {})
-                # transformed["gps"] menyatukan posisi GPS, altitude, dan jumlah satelit.
                 transformed["gps"] = {
-                    # lat adalah latitude drone.
                     "lat": pos.get("lat", 0.0),
-                    # lon adalah longitude drone.
                     "lon": pos.get("lon", 0.0),
-                    # alt adalah altitude relatif drone.
                     "alt": pos.get("alt", 0.0),
-                    # satellites diambil dari sub-dictionary gps.
                     "satellites": raw_state.get("gps", {}).get("satellites", 0),
                 }
 
-                # Velocity data
-                # vel mengambil dictionary velocity NED dari raw_state.
                 vel = raw_state.get("velocity", {})
-                # vx adalah kecepatan north; default 0 jika belum ada data.
                 vx = vel.get("vx", 0.0)
-                # vy adalah kecepatan east; default 0 jika belum ada data.
                 vy = vel.get("vy", 0.0)
-                # ground_speed adalah resultan kecepatan horizontal dari vx dan vy.
                 ground_speed = (vx ** 2 + vy ** 2) ** 0.5
-                # transformed["velocity"] berisi velocity yang siap dikonsumsi frontend.
                 transformed["velocity"] = {
-                    # vx adalah komponen velocity north.
                     "vx": vx,
-                    # vy adalah komponen velocity east.
                     "vy": vy,
-                    # vz adalah komponen velocity down.
                     "vz": vel.get("vz", 0.0),
-                    # ground_speed adalah kecepatan horizontal total.
                     "ground_speed": ground_speed,
                 }
 
-                # Attitude data
-                # att mengambil dictionary attitude dari raw_state.
                 att = raw_state.get("attitude", {})
-                # transformed["attitude"] berisi orientasi drone dalam derajat.
                 transformed["attitude"] = {
-                    # roll adalah kemiringan kiri-kanan.
                     "roll": att.get("roll", 0.0),
-                    # pitch adalah kemiringan depan-belakang.
                     "pitch": att.get("pitch", 0.0),
-                    # yaw adalah arah hadap drone.
                     "yaw": att.get("yaw", 0.0),
                 }
-                # === BARIS SEMENTARA UNTUK SCREENSHOT BAB 3 ===
-                # logger.info("TELEMETRY → mode=%s bat=%.1f%% pos=(%.6f,%.6f) alt=%.1fm heading=%.1f°",
-                #     transformed["mode"], transformed["battery"],
-                #     transformed["gps"]["lat"], transformed["gps"]["lon"],
-                #     transformed["gps"]["alt"], transformed["heading"])
-                # # === AKHIR BARIS SEMENTARA ===
-                # Mengirim event drone:status berisi telemetry yang sudah ditransformasi ke frontend melalui Socket.IO.
+
                 self.socketio.emit("drone:status", transformed, namespace="/")
-                # Delay 0.2 detik membuat broadcast berjalan sekitar 5 Hz.
+
                 await asyncio.sleep(0.2)
             # CancelledError terjadi saat task broadcast dibatalkan.
             except asyncio.CancelledError:
