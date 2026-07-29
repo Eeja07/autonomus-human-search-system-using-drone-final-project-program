@@ -96,7 +96,6 @@ function VideoControl({ onNotification }) {
       {/* Stream Info Panel -> Diubah jadi Video Player MJPEG */}
       <div style={{
         width: '100%',
-        aspectRatio: '16/9',
         background: '#0a0a0f',
         borderRadius: '8px',
         overflow: 'hidden',
@@ -111,7 +110,7 @@ function VideoControl({ onNotification }) {
             alt="Drone Live Stream"
             crossOrigin="use-credentials" // <--- TAMBAHKAN BARIS INI
             // style={{ width: '100%', height: '100%', objectFit: 'fill' }} // <--- UBAH DI SINI
-            style={{ width: '100%', height: '100%', objectFit: 'contain' }} // <--- UBAH DI SINI
+            style={{ width: '100%', height: 'auto', display: 'block' }} // <--- UBAH DI SINI
           />
         ) : (
           <div style={{ display: 'flex', height: '100%', alignItems: 'center', justifyContent: 'center', color: 'rgba(255,255,255,0.5)' }}>
@@ -217,4 +216,4 @@ function VideoControl({ onNotification }) {
   );
 }
 
-export default VideoControl;
+export default VideoControl;  

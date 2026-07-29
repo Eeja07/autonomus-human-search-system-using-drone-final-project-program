@@ -161,10 +161,11 @@ function App() {
           {/* Top Section: Status & Pre-flight */}
           <div className="section-row">
             <DroneStatus status={droneStatus} connected={connected} autonomyStatus={autonomyStatus} />
+          </div>
+          <div className="section-row">
             <VideoControl
               onNotification={addNotification}
             />
-
           </div>
         </div>
       </div>
